@@ -1,0 +1,152 @@
+package main
+
+import (
+	"encoding/json"
+	"log"
+	"math/rand"
+	"net/http"
+	"net/url"
+	"os"
+	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+const letterBytes = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+
+var (
+	urlStore     sync.Map
+	reverseStore sync.Map
+	domainCount  sync.Map
+)
+
+func generateShortCode(n int) string {
+	rand.Seed(time.Now().UnixNano())
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = letterBytes[rand.Intn(len(letterBytes))]
+	}
+	return string(b)
+}
+
+func shortenURLHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Only POST method is allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var payload struct {
+		URL string `json:"url"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		http.Error(w, "Invalid request payload", http.StatusBadRequest)
+		return
+	}
+
+	parsedURL, err := url.ParseRequestURI(payload.URL)
+	if err != nil {
+		http.Error(w, "Invalid URL", http.StatusBadRequest)
+		return
+	}
+
+	if tmp, ok := reverseStore.Load(payload.URL); ok {
+		code := tmp.(string)
+		respondWithJSON(w, map[string]string{"short_url": "/" + code})
+		return
+	}
+
+	code := generateShortCode(6)
+	urlStore.Store(code, payload.URL)
+	reverseStore.Store(payload.URL, code)
+
+	domain := parsedURL.Hostname()
+	val, loaded := domainCount.Load(domain)
+	if !loaded {
+		var count int64 = 1
+		domainCount.Store(domain, &count)
+	} else {
+		countPtr := val.(*int64)
+		atomic.AddInt64(countPtr, 1)
+	}
+
+	respondWithJSON(w, map[string]string{"short_url": "/" + code})
+}
+
+func redirectHandler(w http.ResponseWriter, r *http.Request) {
+	code := strings.TrimPrefix(r.URL.Path, "/")
+	if tmp, ok := urlStore.Load(code); ok {
+		http.Redirect(w, r, tmp.(string), http.StatusFound)
+		return
+	}
+	http.NotFound(w, r)
+}
+
+func metricsHandler(w http.ResponseWriter, r *http.Request) {
+	type domainEntry struct {
+		Domain string `json:"domain"`
+		Count  int64  `json:"count"`
+	}
+
+	entries := make([]domainEntry, 0)
+	domainCount.Range(func(key, value any) bool {
+		entries = append(entries, domainEntry{key.(string), *value.(*int64)})
+		return true
+	})
+
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].Count > entries[j].Count
+	})
+
+	if len(entries) > 3 {
+		entries = entries[:3]
+	}
+	respondWithJSON(w, entries)
+}
+
+func respondWithJSON(w http.ResponseWriter, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(data)
+}
+
+func main() {
+	if len(os.Args) > 1 && os.Args[1] == "test" {
+		testing.Main(matchString, tests, nil, nil)
+		return
+	}
+
+	http.HandleFunc("/shorten", shortenURLHandler)
+	http.HandleFunc("/metrics", metricsHandler)
+	http.HandleFunc("/", redirectHandler)
+
+	log.Println("Server running on :8080")
+	log.Fatal(http.ListenAndServe(":8080", nil))
+}
+
+func matchString(pat, str string) (bool, error) {
+	return true, nil
+}
+
+var tests = []testing.InternalTest{
+	{"TestGenerateShortCodeLength", TestGenerateShortCodeLength},
+	{"TestDomainParsing", TestDomainParsing},
+}
+
+func TestGenerateShortCodeLength(t *testing.T) {
+	code := generateShortCode(8)
+	if len(code) != 8 {
+		t.Errorf("expected code length 8, got %d", len(code))
+	}
+}
+
+func TestDomainParsing(t *testing.T) {
+	u, err := url.Parse("https://example.com/path")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u.Hostname() != "example.com" {
+		t.Errorf("expected domain 'example.com', got '%s'", u.Hostname())
+	}
+}
